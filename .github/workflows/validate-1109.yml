@@ -1,0 +1,18 @@
+name: Validate issue 1109
+
+on:
+  push:
+    branches:
+      - validate/1109-subagent-history-upgrade
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-python-env
+      - name: Run focused subagent history tests
+        run: python -m pytest tests/test_subagent_execution_history.py -q --tb=short
