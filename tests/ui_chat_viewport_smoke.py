@@ -16,6 +16,54 @@ _CAPTURE_TEST_SOCKET = """() => {
         }
     };
 }"""
+# One page-wide /api/state read is in flight at a time (chat_activity.js
+# createStateSnapshotSequencer.gate): a forced refresh that lands behind an
+# in-flight read starts only after that read settles, so the socket-open census
+# can still be reading after the socket reports OPEN. A frame emitted on the test
+# socket exists nowhere on the server; a complete census whose request started
+# after that frame concludes its card by absence, exactly as it would a task the
+# queue really lost. Tests that emit such frames wait for the reads to land first.
+_OBSERVE_STATE_READS = """() => {
+    window.__stateReadsInFlight = 0;
+    window.__stateReadsSettled = 0;
+    const nativeFetch = window.fetch.bind(window);
+    const settle = () => { window.__stateReadsInFlight -= 1; window.__stateReadsSettled += 1; };
+    window.fetch = (input, init) => {
+        const raw = typeof input === 'string' ? input : input?.url || '';
+        if (new URL(raw, location.href).pathname !== '/api/state') return nativeFetch(input, init);
+        window.__stateReadsInFlight += 1;
+        return nativeFetch(input, init).then((response) => {
+            if (!response.ok) { settle(); return response; }
+            // A reader applies right after resp.json() resolves, and the gate
+            // starts the coalesced follow-up in that same microtask turn, so
+            // counting the read as settled here never exposes a false quiet gap.
+            const nativeJson = response.json.bind(response);
+            response.json = () => nativeJson().finally(settle);
+            return response;
+        }, (error) => { settle(); throw error; });
+    };
+}"""
+_STATE_READS_QUIESCENT = "() => window.__stateReadsInFlight === 0 && window.__stateReadsSettled > 0"
+
+
+def _wait_state_reads_quiescent(page, timeout=30_000):
+    """No /api/state read in flight, at least one landed; needs _OBSERVE_STATE_READS."""
+    page.wait_for_function(_STATE_READS_QUIESCENT, timeout=timeout)
+
+
+_TEST_SOCKET_OPEN = "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)"
+
+
+def _wait_socket_open_quiescent(page, timeout=30_000):
+    """A test socket is OPEN and the socket-open census has landed (both init scripts).
+
+    A frame emitted on the test socket before that census settles is concluded
+    by absence when the census applies, exactly like a task the queue lost.
+    """
+    page.wait_for_function(_TEST_SOCKET_OPEN, timeout=timeout)
+    _wait_state_reads_quiescent(page, timeout)
+
+
 _SETTLE_TWO_FRAMES = "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
 _SETTLE_RESTORE_FRAMES = """() => new Promise(resolve => {
     let remaining = 14;
@@ -88,6 +136,20 @@ def run_chat_viewport_smoke(
         page.evaluate(_SETTLE_TWO_FRAMES)
         return result
 
+    def read_to_latest(page):
+        # Follow is reading intent: the reader's own wheel reaches the live edge.
+        # A scripted scroll (set_remaining) moves the view but decides nothing.
+        box = page.locator("#chat-messages").bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.wheel(0, jump_state(page)["remaining"] + 200)
+        page.wait_for_function(
+            """() => {
+                const messages = document.querySelector('#chat-messages');
+                return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 1;
+            }"""
+        )
+        page.evaluate(_SETTLE_TWO_FRAMES)
+
     def jump_state(page):
         return page.evaluate(
             """() => {
@@ -109,7 +171,7 @@ def run_chat_viewport_smoke(
         )
 
     def begin_noop_read(page):
-        set_remaining(page, 0)
+        read_to_latest(page)
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
@@ -172,10 +234,7 @@ def run_chat_viewport_smoke(
                     "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
                     timeout=30_000,
                 )
-                page.wait_for_function(
-                    "() => document.querySelector('#chat-messages')?.innerText.includes('Ouroboros has awakened')",
-                    timeout=30_000,
-                )
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # Threshold assertions start after the page-show restore lease;
                 # WebKit otherwise applies its final scheduled pin mid-scenario.
                 page.evaluate(_SETTLE_RESTORE_FRAMES)
@@ -223,7 +282,9 @@ def run_chat_viewport_smoke(
                 assert state["visible"] and state["dotHidden"], state
                 assert state["label"] == state["title"] == "Scroll to latest message", state
 
-                # The visible pre-mutation distance is the only live-follow truth.
+                # A following reader follows only from within the 48px zone:
+                # the visible pre-mutation distance decides.
+                read_to_latest(page)
                 for case, target in enumerate((0, 40)):
                     assert abs(set_remaining(page, target)["remaining"] - target) <= 2
                     _emit_ws_frame(page, {
@@ -264,9 +325,9 @@ def run_chat_viewport_smoke(
                     set_remaining(page, 0)
                     assert jump_state(page)["dotHidden"]
 
-                # `_savedStick` is deliberately stale here: scroll and delivery
+                # Follow intent is deliberately stale here: scroll and delivery
                 # happen in one JS turn, before a native scroll event can repair it.
-                set_remaining(page, 0)
+                read_to_latest(page)
                 stale = page.evaluate(
                     """frame => {
                         const messages = document.querySelector('#chat-messages');
@@ -352,7 +413,12 @@ def run_chat_viewport_smoke(
                 # Browser visibility is a lifecycle seam. A hidden pinned
                 # reader re-follows; a hidden history reader keeps its saved
                 # numeric position and receives the coalesced activity bit.
-                set_remaining(page, 0)
+                # Following is the reader's intent, set by ↓ or their own
+                # gesture; a scripted scroll event alone decides neither.
+                button.click()
+                page.evaluate(_SETTLE_TWO_FRAMES)
+                state = jump_state(page)
+                assert state["remaining"] <= 6 and state["dotHidden"], state
                 page.evaluate(
                     """() => {
                         window.__testDocumentHidden = true;
@@ -378,7 +444,16 @@ def run_chat_viewport_smoke(
                 state = jump_state(page)
                 assert state["remaining"] <= 6 and state["dotHidden"], state
 
-                set_remaining(page, 300)
+                box = page.locator("#chat-messages").bounding_box()
+                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                page.mouse.wheel(0, -300)
+                page.wait_for_function(
+                    """() => {
+                        const messages = document.querySelector('#chat-messages');
+                        return messages.scrollHeight - messages.scrollTop - messages.clientHeight >= 298;
+                    }"""
+                )
+                page.evaluate(_SETTLE_TWO_FRAMES)
                 hidden_top = page.locator("#chat-messages").evaluate("node => node.scrollTop")
                 page.evaluate(
                     """() => {

@@ -219,7 +219,7 @@ function makeInstance(mount) {
     };
     let generation = 0;
     const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
         isCurrent: () => true,
         apply() {},
     };
@@ -255,7 +255,16 @@ const PLAIN_ROW = {
     ts: '2026-08-31T00:00:00Z',
 };
 
-test('plain project row renders escaped text with Open Project and no markdown machinery', async () => {
+// The stub DOM does not aggregate descendant text, so a reference is read by its own parts.
+const referenceShape = (node) => ({
+    intent: node?.dataset?.intent,
+    pill: Boolean(node?.classList?.contains('chat-quiz-project')),
+    parts: (node?.children || []).map((child) => child.textContent),
+    spoken: node?.getAttribute?.('aria-label'),
+});
+const LAUNCH_REFERENCE = { intent: 'open-project', pill: true, parts: ['', 'Launch', '↗'], spoken: 'Open project Launch' };
+
+test('plain project row renders escaped text with the Project reference and no markdown machinery', async () => {
     const { prior, mount } = installDom();
     let instance;
     try {
@@ -276,9 +285,10 @@ test('plain project row renders escaped text with Open Project and no markdown m
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
         assert.equal(message.contains(actions), false);
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
         assert.ok(actions, 'system-message-actions container present');
-        assert.equal(actions.children[0]?.textContent, 'Open Project ↗');
+        // The row points at its Project with the one reference, never a button of its own.
+        assert.deepEqual(referenceShape(actions.children[0]), LAUNCH_REFERENCE);
     } finally {
         instance?.destroy();
         restoreDom(prior);
@@ -312,15 +322,12 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
         assert.doesNotMatch(bubble.innerHTML, /Open the Project for details|Completed/);
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
-        // One control: the Project chip names the Project and opens it; no second button.
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
+        // One control, and the SAME one the System row carries: the voice of a row never
+        // chooses how the UI points at its Project.
         assert.equal(actions.children.length, 1);
         const chip = actions.children[0];
-        assert.ok(chip.classList.contains('chat-quiz-project'));
-        // The stub DOM does not aggregate descendant text, so read the chip's own parts.
-        const chipText = chip.children.map((node) => node.textContent).join('');
-        assert.match(chipText, /Launch/);
-        assert.doesNotMatch(chipText, /Open Project/);
+        assert.deepEqual(referenceShape(chip), LAUNCH_REFERENCE);
         // The stub DOM has no event loop: run the chip's own click listener and
         // capture what it hands to the window.
         let opened = null;
@@ -334,7 +341,9 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
             globalThis.window.dispatchEvent = priorDispatch;
             globalThis.CustomEvent = priorCustomEvent;
         }
-        assert.deepEqual(opened, { type: 'ouro:open-project', detail: { project: { id: 'launch', name: 'Launch' } } });
+        assert.deepEqual(opened, {
+            type: 'ouro:open-project', detail: { project: { id: 'launch', name: 'Launch' }, task_id: '', quiz_id: '' },
+        });
     } finally {
         instance?.destroy();
         restoreDom(prior);
@@ -393,7 +402,7 @@ test('the fold is CSS over the complete answer: clamp always, fade only when fol
     assert.match(rules, /\.chat-bubble\.project-answer\.is-folded > \.message \{[^}]*mask-image/);
     assert.doesNotMatch(rules, /user-select|font-size: \d|#[0-9a-fA-F]{3,6}\b/);
     // chat.js stays a caller: the decoration lives in its own module.
-    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName \}\)/);
+    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName,/);
 });
 
 test('plain system row renders identically live and after history reload', async () => {

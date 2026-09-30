@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Sequence
 from decimal import Decimal, InvalidOperation
 
 from ouroboros.usage_ledger import _number
+from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exact_money, decimal_of
 
 REVIEW_ATTRIBUTION_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
 
@@ -40,11 +41,12 @@ def _merge_processing_summary(total: dict, addition: dict) -> None:
         if value is None or isinstance(value, bool):
             continue
         try:
-            amount = Decimal(str(value))
+            amount = decimal_of(value)
         except (InvalidOperation, ValueError):
             continue
         if amount.is_finite() and amount >= 0:
-            total[key] = total.get(key, Decimal(0)) + amount
+            with exact_money():
+                total[key] = total.get(key, Decimal(0)) + amount
     for key in ("unknown_cash_rows", "unknown_valuation_rows"):
         if key in addition:
             total[key] = total.get(key, 0) + int(addition[key])
@@ -97,7 +99,7 @@ def _processing_summary(rows: Sequence[Dict[str, Any]], *, decimal_values: bool 
 
 
 def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    settled = confirmed = estimated = reserved = unresolved = 0.0
+    cash = ZERO_CASH
     unknown = 0
     # Finality is a COUNT of OPEN ROWS, not a truthiness test on dollar sums. Three of the
     # four old terms asked a STATE question of a float, so any row that is genuinely open
@@ -116,11 +118,22 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     # reporting `cost_final: false` with every dollar bucket at zero and `unknown` at zero
     # is a flag no reader can reconstruct.
     non_final_rows = 0
+    # Rows whose money is KNOWN: a settled price, or a reservation upper bound a
+    # still-open row is carrying. It is the evidence behind a ZERO — an empty
+    # ledger and a ledger of exclusively unpriced rows both sum to 0.0, and only
+    # this count separates "nothing was spent" from "nothing is known" (#498).
+    # Weighted like every other axis, so a compacted baseline group answers the
+    # same as the final attempt rows it folded.
+    priced_rows = 0
+    # Presentation facts are independent of cost_final: a settled unpriced
+    # attempt leaves the total unknown without making a known subtotal inexact.
+    tracked_nonfinal_rows = accounting_open_rows = 0
     counts: Dict[str, int] = {}
     # Session count/quota and incremental cash remain separate observed axes.
     sessions = 0
     session_windows: Dict[str, str] = {}
     for row in rows:
+        cash = change_cash(cash, new=cash_contribution(row))
         state = str(row.get("state") or "")
         kind = str(row.get("kind") or "")
         if kind == "usage_baseline":
@@ -155,39 +168,39 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 non_final_rows += weight
                 bound = _number(row.get("reservation_upper_bound_usd"))
                 if bound is not None:
-                    unresolved += bound
+                    priced_rows += weight
+                    tracked_nonfinal_rows += weight
+                    accounting_open_rows += weight
             else:
-                settled += cost
-                if bool(row.get("cost_final")):
-                    confirmed += cost
-                else:
-                    estimated += cost
+                priced_rows += weight
+                if not bool(row.get("cost_final")):
                     non_final_rows += weight
+                    tracked_nonfinal_rows += weight
+                    accounting_open_rows += weight
         elif state == "reserved":
             non_final_rows += weight
+            accounting_open_rows += weight
             bound = _number(row.get("reservation_upper_bound_usd"))
             if bound is None or pricing_unknown:
                 unknown += weight
             if bound is not None:
-                reserved += bound
+                priced_rows += weight
+                tracked_nonfinal_rows += weight
         elif state in {"dispatched", "unresolved"}:
             non_final_rows += weight
+            accounting_open_rows += weight
             bound = _number(row.get("reservation_upper_bound_usd"))
             if bound is None or pricing_unknown:
                 unknown += weight
             if bound is not None:
-                unresolved += bound
-    settled, confirmed, estimated, reserved, unresolved = (
-        round(value, 6) for value in (settled, confirmed, estimated, reserved, unresolved)
-    )
+                priced_rows += weight
+                tracked_nonfinal_rows += weight
     return {
-        "settled_usd": settled,
-        "confirmed_usd": confirmed,
-        "estimated_usd": estimated,
-        "reserved_usd": reserved,
-        "unresolved_upper_bound_usd": unresolved,
-        "accounted_usd": round(settled + reserved + unresolved, 6),
+        **render_cash(cash),
         "unknown_unmetered": unknown,
+        "priced_rows": priced_rows,
+        "tracked_nonfinal_rows": tracked_nonfinal_rows,
+        "accounting_open_rows": accounting_open_rows,
         # Every row that increments `unknown` is open, so the old `not unknown` term is
         # subsumed here rather than dropped.
         "non_final_rows": non_final_rows,
@@ -214,6 +227,35 @@ def _with_integrity(summary: Dict[str, Any], degraded: bool) -> Dict[str, Any]:
     if degraded:
         summary["cost_final"] = False
     return summary
+
+
+def _projection_from_final(
+    final: list, integrity_degraded: bool, configured_limit: Optional[float] = None,
+    *, root_task_id: str = "", include_roots: bool = True,
+) -> Dict[str, Any]:
+    """Render the money projection from ALREADY-VALIDATED final rows: one
+    snapshot, one projection, so a caller deriving the ordering marker from
+    the SAME rows writes both under one authority instead of pairing a marker
+    with a second, later ledger read."""
+    def limit_of(rows: list) -> Optional[float]:
+        known = [v for v in (_number(row.get("root_limit_usd")) for row in rows) if v is not None]
+        return min(known) if known else None
+    if root_task_id:
+        rows = [row for row in final if monetary_scope_key(row) == root_task_id]
+        return _with_integrity(_with_limit(_summary(rows), limit_of(rows)), integrity_degraded)
+    result = _with_limit(_summary(final), configured_limit)
+    if include_roots:
+        grouped: Dict[str, list] = {}
+        for row in final:
+            rid = monetary_scope_key(row)
+            if rid:
+                grouped.setdefault(rid, []).append(row)
+        result["by_root"] = {
+            rid: _with_integrity(_with_limit(_summary(grouped[rid]), limit_of(grouped[rid])),
+                                 integrity_degraded)
+            for rid in sorted(grouped)
+        }
+    return _with_integrity(result, integrity_degraded)
 
 
 def _marker_from_final(final: Sequence[Dict[str, Any]]) -> Optional[list]:
@@ -310,7 +352,7 @@ _SKILL_ATTEMPT_FIELDS = (
     "cost_usd", "cost_final", "reservation_upper_bound_usd", "pricing_known",
     "prompt_tokens", "completion_tokens", "cached_tokens", "subscription_route",
     "subscription_reset_at", "credential_profile_id", "access_profile",
-    "processing", "processing_basis", "cost_evidence", "attempt_execution",
+    "effort", "effort_resolution", "processing", "processing_basis", "cost_evidence", "attempt_execution",
 )
 
 
